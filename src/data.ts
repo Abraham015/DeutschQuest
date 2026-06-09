@@ -1,4 +1,20 @@
-import type { Flashcard, Folder } from "./types";
+import type { Flashcard, Folder, Section } from "./types";
+
+export const importedFolderCounts: Record<string, number> = {
+  "extras-verb-prepositions": 366,
+  "extras-object-case-verbs": 257,
+  "a1-b1-irregular-perfect": 284,
+  "extras-basic-case-verbs": 109,
+};
+
+export const starterSections: Section[] = [
+  { id: "A1", name: "A1" },
+  { id: "A2", name: "A2" },
+  { id: "B1", name: "B1" },
+  { id: "B2", name: "B2" },
+  { id: "Extras", name: "Extras" },
+  { id: "A1-B1", name: "A1-B1" },
+];
 
 export const starterFolders: Folder[] = [
   { id: "a1-basics", name: "Primeros pasos", level: "A1", description: "Saludos y frases esenciales", color: "#f59e0b" },
@@ -6,6 +22,10 @@ export const starterFolders: Folder[] = [
   { id: "a1-verbs", name: "Verbos esenciales", level: "A1", description: "Acciones para comenzar", color: "#6366f1" },
   { id: "a2-travel", name: "Viajes", level: "A2", description: "Moverse y pedir ayuda", color: "#ec4899" },
   { id: "b1-work", name: "Trabajo", level: "B1", description: "Entorno profesional", color: "#0ea5e9" },
+  { id: "extras-verb-prepositions", name: "Verbos con preposición", level: "Extras", description: "Verbos, preposiciones y casos del material", color: "#8b5cf6" },
+  { id: "extras-object-case-verbs", name: "Verbos con objeto Dativ y Akkusativ", level: "Extras", description: "Verbos organizados según el objeto que requieren", color: "#0f766e" },
+  { id: "a1-b1-irregular-perfect", name: "Perfekt de verbos irregulares", level: "A1-B1", description: "Infinitivo, Präsens, Perfekt y ejemplos", color: "#c2410c" },
+  { id: "extras-basic-case-verbs", name: "Verbos básicos con Akkusativ y Dativ", level: "Extras", description: "Verbos básicos con casos y ejemplos traducidos", color: "#2563eb" },
 ];
 
 export const starterCards: Flashcard[] = [

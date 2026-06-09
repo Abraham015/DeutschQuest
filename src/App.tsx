@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { starterCards, starterFolders } from "./data";
-import type { CardKind, Flashcard, Folder, Level } from "./types";
+import { importedFolderCounts, starterCards, starterFolders, starterSections } from "./data";
+import type { CardKind, Flashcard, Folder, Level, Section } from "./types";
 
-const levels: Array<Level | "Todos"> = ["Todos", "A1", "A2", "B1", "B2"];
 const kinds: CardKind[] = ["Sustantivo", "Verbo", "Expresion"];
 type StudyMode = "flashcard" | "multiple" | "write";
 type AnswerState = "idle" | "correct" | "incorrect";
 type StudyDirection = "de-es" | "es-de";
+const importedFolderIds = new Set(Object.keys(importedFolderCounts));
+const importVersion = "additional-pdfs-v1";
+const libraryPageSize = 48;
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -23,13 +25,26 @@ function isGrammarFolder(folder: Folder) {
 }
 
 function loadFolders() {
-  return load<Folder[]>("dq-folders", starterFolders).filter((folder) => !isGrammarFolder(folder));
+  const saved = load<Folder[]>("dq-folders", starterFolders);
+  const additions = localStorage.getItem("dq-import-version") === importVersion
+    ? []
+    : starterFolders.filter((folder) => importedFolderIds.has(folder.id) && !saved.some((item) => item.id === folder.id));
+  return [...saved, ...additions].filter((folder) => !isGrammarFolder(folder));
+}
+
+function loadSections() {
+  const saved = load<Section[]>("dq-sections", starterSections);
+  const folderLevels = loadFolders().map((folder) => folder.level);
+  const importedLevels = localStorage.getItem("dq-import-version") === importVersion ? [] : ["A1-B1"];
+  const missing = [...new Set([...folderLevels, ...importedLevels])].filter((level) => !saved.some((section) => section.id === level));
+  return [...saved, ...missing.map((level) => ({ id: level, name: level }))];
 }
 
 function loadCards(validFolders: Folder[]) {
   const folderIds = new Set(validFolders.map((folder) => folder.id));
-  return load<Flashcard[]>("dq-cards", starterCards).filter(
-    (card) => folderIds.has(card.folderId) && (card.kind as string) !== "Gramatica",
+  const saved = load<Flashcard[]>("dq-cards", starterCards);
+  return saved.filter(
+    (card) => !card.id.startsWith("verb-prep-") && folderIds.has(card.folderId) && (card.kind as string) !== "Gramatica",
   );
 }
 
@@ -39,7 +54,11 @@ function shuffled<T>(items: T[]) {
 
 export default function App() {
   const [folders, setFolders] = useState<Folder[]>(loadFolders);
+  const [sections, setSections] = useState<Section[]>(loadSections);
   const [cards, setCards] = useState<Flashcard[]>(() => loadCards(loadFolders()));
+  const [importedCards, setImportedCards] = useState<Flashcard[]>([]);
+  const [importedCardsLoading, setImportedCardsLoading] = useState(false);
+  const [visibleCardCount, setVisibleCardCount] = useState(libraryPageSize);
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [activeLevel, setActiveLevel] = useState<Level | "Todos">("Todos");
   const [query, setQuery] = useState("");
@@ -54,20 +73,29 @@ export default function App() {
   const [answerState, setAnswerState] = useState<AnswerState>("idle");
   const [menuOpen, setMenuOpen] = useState(false);
   const [adding, setAdding] = useState<"folder" | "card" | null>(null);
+  const [editingFolder, setEditingFolder] = useState<Folder | null>(null);
+  const [editingSection, setEditingSection] = useState<Section | null>(null);
+  const [addingSection, setAddingSection] = useState(false);
 
   useEffect(() => localStorage.setItem("dq-folders", JSON.stringify(folders)), [folders]);
+  useEffect(() => localStorage.setItem("dq-sections", JSON.stringify(sections)), [sections]);
   useEffect(() => localStorage.setItem("dq-cards", JSON.stringify(cards)), [cards]);
+  useEffect(() => localStorage.setItem("dq-import-version", importVersion), []);
 
+  const activeImportedFolderIds = useMemo(() => new Set(folders.filter((item) => importedFolderIds.has(item.id)).map((item) => item.id)), [folders]);
+  const allCards = useMemo(() => [...cards, ...importedCards.filter((card) => activeImportedFolderIds.has(card.folderId))], [cards, importedCards, activeImportedFolderIds]);
   const visibleFolders = folders.filter((folder) => activeLevel === "Todos" || folder.level === activeLevel);
+  const activeSection = activeLevel === "Todos" ? undefined : sections.find((section) => section.id === activeLevel);
   const folder = folders.find((item) => item.id === selectedFolder);
-  const folderCards = cards.filter((card) => card.folderId === selectedFolder);
+  const folderCards = allCards.filter((card) => card.folderId === selectedFolder);
   const searchCards = query.trim()
-    ? cards.filter((card) => `${card.german} ${card.spanish} ${card.example}`.toLowerCase().includes(query.toLowerCase()))
+    ? allCards.filter((card) => `${card.german} ${card.spanish} ${card.example} ${card.exampleSpanish ?? ""}`.toLowerCase().includes(query.toLowerCase()))
     : [];
-  const totalStudied = Math.min(cards.length, 18);
-  const progress = cards.length ? Math.round((totalStudied / cards.length) * 100) : 0;
+  const totalCardCount = cards.length + [...activeImportedFolderIds].reduce((total, id) => total + importedFolderCounts[id], 0);
+  const totalStudied = Math.min(totalCardCount, 18);
+  const progress = totalCardCount ? Math.round((totalStudied / totalCardCount) * 100) : 0;
 
-  const shuffledFolderCards = useMemo(() => shuffled(folderCards), [selectedFolder, mode]);
+  const shuffledFolderCards = useMemo(() => shuffled(folderCards), [selectedFolder, mode, allCards]);
   const currentStudyCards = studyMode === "flashcard"
     ? shuffledFolderCards
     : shuffledFolderCards.slice(0, Math.min(studyCount, shuffledFolderCards.length));
@@ -76,9 +104,24 @@ export default function App() {
   const correctAnswer = currentCard ? (studyDirection === "de-es" ? currentCard.spanish : currentCard.german) : "";
   const multipleOptions = useMemo(() => {
     if (!currentCard) return [];
-    const alternatives = cards.filter((card) => card.id !== currentCard.id);
+    const alternatives = allCards.filter((card) => card.id !== currentCard.id);
     return shuffled([currentCard, ...shuffled(alternatives).slice(0, 3)]);
-  }, [currentCard, cards, studyDirection]);
+  }, [currentCard, allCards, studyDirection]);
+
+  async function loadImportedCards() {
+    if (!activeImportedFolderIds.size || importedCards.length || importedCardsLoading) return;
+    setImportedCardsLoading(true);
+    try {
+      const module = await import("./importedCards");
+      setImportedCards(module.importedCards);
+    } finally {
+      setImportedCardsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (query.trim()) void loadImportedCards();
+  }, [query]);
 
   function resetQuestion(nextMode = studyMode) {
     setStudyMode(nextMode);
@@ -91,8 +134,40 @@ export default function App() {
 
   function openFolder(id: string) {
     setSelectedFolder(id);
+    setVisibleCardCount(libraryPageSize);
     setMode("library");
     resetQuestion("flashcard");
+    if (importedFolderIds.has(id)) void loadImportedCards();
+  }
+
+  function deleteFolder(folderToDelete: Folder) {
+    if (!window.confirm(`¿Eliminar la carpeta "${folderToDelete.name}" y todas sus tarjetas?`)) return;
+    setFolders((current) => current.filter((item) => item.id !== folderToDelete.id));
+    setCards((current) => current.filter((card) => card.folderId !== folderToDelete.id));
+    setSelectedFolder(null);
+  }
+
+  function deleteSection(section: Section) {
+    const folderIds = new Set(folders.filter((item) => item.level === section.id).map((item) => item.id));
+    if (!window.confirm(`¿Eliminar la sección "${section.name}", sus carpetas y todas sus tarjetas?`)) return;
+    setSections((current) => current.filter((item) => item.id !== section.id));
+    setFolders((current) => current.filter((item) => item.level !== section.id));
+    setCards((current) => current.filter((card) => !folderIds.has(card.folderId)));
+    setActiveLevel("Todos");
+    setSelectedFolder(null);
+    setEditingSection(null);
+  }
+
+  function saveSection(nextSection: Section, previousId?: string) {
+    if (previousId) {
+      setSections((current) => current.map((item) => item.id === previousId ? nextSection : item));
+      setFolders((current) => current.map((item) => item.level === previousId ? { ...item, level: nextSection.id } : item));
+      if (activeLevel === previousId) setActiveLevel(nextSection.id);
+    } else {
+      setSections((current) => [...current, nextSection]);
+    }
+    setEditingSection(null);
+    setAddingSection(false);
   }
 
   function startPractice() {
@@ -164,7 +239,7 @@ export default function App() {
             </section>
 
             <section className="stats">
-              <article><span>Tarjetas</span><strong>{cards.length}</strong><small>en tu biblioteca</small></article>
+              <article><span>Tarjetas</span><strong>{totalCardCount}</strong><small>en tu biblioteca</small></article>
               <article><span>Carpetas</span><strong>{folders.length}</strong><small>por tema y nivel</small></article>
               <article><span>Repasadas</span><strong>{totalStudied}</strong><small>esta semana</small></article>
               <article><span>Racha actual</span><strong>7 días</strong><small>mejor: 12 días</small></article>
@@ -174,10 +249,11 @@ export default function App() {
               <div><span className="eyebrow dark">BIBLIOTECA</span><h2>Tus carpetas</h2></div>
               <button className="primary" onClick={() => setAdding("folder")}>+ Nueva carpeta</button>
             </section>
-            <div className="level-tabs">{levels.map((level) => <button key={level} className={activeLevel === level ? "active" : ""} onClick={() => setActiveLevel(level)}>{level}</button>)}</div>
+            <div className="level-tabs"><button className={activeLevel === "Todos" ? "active" : ""} onClick={() => setActiveLevel("Todos")}>Todos</button>{sections.map((section) => <button key={section.id} className={activeLevel === section.id ? "active" : ""} onClick={() => setActiveLevel(section.id)}>{section.name}</button>)}<button className="add-section" onClick={() => setAddingSection(true)}>+ Sección</button></div>
+            {activeSection && <section className="active-section-bar"><div><span>SECCIÓN</span><h3>{activeSection.name}</h3><small>{visibleFolders.length} {visibleFolders.length === 1 ? "carpeta" : "carpetas"}</small></div><button onClick={() => setEditingSection(activeSection)}>Editar sección</button></section>}
             <section className="folder-grid">
               {visibleFolders.map((item) => {
-                const count = cards.filter((card) => card.folderId === item.id).length;
+                const count = cards.filter((card) => card.folderId === item.id).length + (importedFolderCounts[item.id] ?? 0);
                 return <button className="folder-card" key={item.id} onClick={() => openFolder(item.id)} style={{ "--accent": item.color } as React.CSSProperties}>
                   <span className="folder-level">{item.level}</span><i>▰</i><h3>{item.name}</h3><p>{item.description}</p><small>{count} tarjetas <b>→</b></small>
                 </button>;
@@ -193,11 +269,12 @@ export default function App() {
                 <button className={mode === "library" ? "active" : ""} onClick={() => setMode("library")}>Biblioteca</button>
                 <button className={mode === "study" ? "active" : ""} onClick={startPractice}>Practicar</button>
                 <button className="primary" onClick={() => setAdding("card")}>+ Tarjeta</button>
+                <details className="action-menu"><summary aria-label="Más opciones de carpeta">•••</summary><div><button onClick={() => setEditingFolder(folder)}>Editar carpeta</button><button className="danger-action" onClick={() => deleteFolder(folder)}>Eliminar carpeta</button></div></details>
               </div>
             </section>
 
             {mode === "library" ? (
-              <section className="card-grid">{folderCards.map((card) => <article className="word-card" key={card.id}><span>{card.kind}</span><h2>{card.german}</h2><strong>{card.spanish}</strong><p>{card.example}</p>{card.note && <small>{card.note}</small>}<button onClick={() => setCards(cards.filter((item) => item.id !== card.id))}>Eliminar</button></article>)}</section>
+              importedCardsLoading ? <p className="empty">Cargando tarjetas...</p> : <><section className="card-grid">{folderCards.slice(0, visibleCardCount).map((card) => <article className="word-card" key={card.id}><span>{card.kind}</span><h2>{card.german}</h2><strong>{card.spanish}</strong><p>{card.example}</p>{card.exampleSpanish && <p className="example-translation">{card.exampleSpanish}</p>}{card.note && <small>{card.note}</small>}{!card.id.startsWith("verb-prep-") && <button onClick={() => setCards(cards.filter((item) => item.id !== card.id))}>Eliminar</button>}</article>)}</section>{visibleCardCount < folderCards.length && <button className="load-more" onClick={() => setVisibleCardCount((count) => count + libraryPageSize)}>Mostrar más ({folderCards.length - visibleCardCount} restantes)</button>}</>
             ) : currentCard ? (
               <section className="study-area">
                 <div className="study-modes">
@@ -220,7 +297,7 @@ export default function App() {
                   <div className="session-complete"><span>SESIÓN COMPLETADA</span><h2>Terminaste {currentStudyCards.length} tarjetas</h2><p>Puedes cambiar la cantidad o dirección antes de volver a practicar.</p><button className="primary" onClick={restartSession}>Practicar de nuevo</button></div>
                 ) : studyMode === "flashcard" ? (
                   <button className="study-card" onClick={() => setShowAnswer(!showAnswer)}>
-                    {!showAnswer ? <><span>{currentCard.kind}</span><h2>{currentCard.german}</h2><small>Toca para mostrar la respuesta</small></> : <><span>Significado</span><h2>{currentCard.spanish}</h2><p>{currentCard.example}</p><small>{currentCard.note}</small></>}
+                    {!showAnswer ? <><span>{currentCard.kind}</span><h2>{currentCard.german}</h2><small>Toca para mostrar la respuesta</small></> : <><span>Significado</span><h2>{currentCard.spanish}</h2><p>{currentCard.example}</p>{currentCard.exampleSpanish && <p className="example-translation">{currentCard.exampleSpanish}</p>}<small>{currentCard.note}</small></>}
                   </button>
                 ) : studyMode === "multiple" ? (
                   <div className="quiz-card">
@@ -250,24 +327,34 @@ export default function App() {
         )}
       </main>
 
-      {adding === "folder" && <FolderModal onClose={() => setAdding(null)} onSave={(newFolder) => { setFolders([...folders, newFolder]); setAdding(null); }} />}
+      {adding === "folder" && <FolderModal sections={sections} onClose={() => setAdding(null)} onSave={(newFolder) => { setFolders([...folders, newFolder]); setAdding(null); }} />}
+      {editingFolder && <FolderModal sections={sections} initial={editingFolder} onClose={() => setEditingFolder(null)} onSave={(updated) => { setFolders(folders.map((item) => item.id === updated.id ? updated : item)); setEditingFolder(null); }} />}
+      {(addingSection || editingSection) && <SectionModal initial={editingSection ?? undefined} sections={sections} onClose={() => { setAddingSection(false); setEditingSection(null); }} onSave={saveSection} onDelete={editingSection ? deleteSection : undefined} />}
       {adding === "card" && folder && <CardModal folderId={folder.id} onClose={() => setAdding(null)} onSave={(card) => { setCards([...cards, card]); setAdding(null); }} />}
     </div>
   );
 }
 
-function FolderModal({ onClose, onSave }: { onClose: () => void; onSave: (folder: Folder) => void }) {
-  const [name, setName] = useState("");
-  const [level, setLevel] = useState<Level>("A1");
-  const [description, setDescription] = useState("");
-  return <div className="modal-layer"><button className="modal-backdrop" onClick={onClose} /><form className="modal" onSubmit={(event) => { event.preventDefault(); if (name.trim()) onSave({ id: crypto.randomUUID(), name, level, description, color: "#6366f1" }); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow dark">NUEVA COLECCIÓN</span><h2>Crear carpeta</h2><label>Nombre<input value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej. Comida y restaurante" autoFocus /></label><label>Nivel<select value={level} onChange={(e) => setLevel(e.target.value as Level)}>{levels.slice(1).map((item) => <option key={item}>{item}</option>)}</select></label><label>Descripción<input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Contenido de la carpeta" /></label><button className="primary">Crear carpeta</button></form></div>;
+function FolderModal({ sections, initial, onClose, onSave }: { sections: Section[]; initial?: Folder; onClose: () => void; onSave: (folder: Folder) => void }) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const [level, setLevel] = useState<Level>(initial?.level ?? sections[0]?.id ?? "");
+  const [description, setDescription] = useState(initial?.description ?? "");
+  return <div className="modal-layer"><button className="modal-backdrop" onClick={onClose} /><form className="modal" onSubmit={(event) => { event.preventDefault(); if (name.trim() && level) onSave({ id: initial?.id ?? crypto.randomUUID(), name: name.trim(), level, description: description.trim(), color: initial?.color ?? "#6366f1" }); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow dark">{initial ? "EDITAR COLECCIÓN" : "NUEVA COLECCIÓN"}</span><h2>{initial ? "Editar carpeta" : "Crear carpeta"}</h2><label>Nombre<input value={name} onChange={(e) => setName(e.target.value)} placeholder="Ej. Comida y restaurante" autoFocus /></label><label>Sección<select value={level} onChange={(e) => setLevel(e.target.value)}>{sections.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Descripción<input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Contenido de la carpeta" /></label><button className="primary">{initial ? "Guardar cambios" : "Crear carpeta"}</button></form></div>;
+}
+
+function SectionModal({ initial, sections, onClose, onSave, onDelete }: { initial?: Section; sections: Section[]; onClose: () => void; onSave: (section: Section, previousId?: string) => void; onDelete?: (section: Section) => void }) {
+  const [name, setName] = useState(initial?.name ?? "");
+  const normalizedId = name.trim();
+  const duplicate = sections.some((section) => section.id.toLowerCase() === normalizedId.toLowerCase() && section.id !== initial?.id);
+  return <div className="modal-layer"><button className="modal-backdrop" onClick={onClose} /><form className="modal" onSubmit={(event) => { event.preventDefault(); if (normalizedId && !duplicate) onSave({ id: normalizedId, name: normalizedId }, initial?.id); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow dark">{initial ? "EDITAR SECCIÓN" : "NUEVA SECCIÓN"}</span><h2>{initial ? "Editar sección" : "Crear sección"}</h2><label>Nombre<input value={name} onChange={(event) => setName(event.target.value)} placeholder="Ej. C1 o Verbos" autoFocus /></label>{duplicate && <p className="form-error">Ya existe una sección con ese nombre.</p>}<button className="primary" disabled={!normalizedId || duplicate}>{initial ? "Guardar cambios" : "Crear sección"}</button>{initial && onDelete && <button type="button" className="danger-button" onClick={() => onDelete(initial)}>Eliminar sección</button>}</form></div>;
 }
 
 function CardModal({ folderId, onClose, onSave }: { folderId: string; onClose: () => void; onSave: (card: Flashcard) => void }) {
   const [german, setGerman] = useState("");
   const [spanish, setSpanish] = useState("");
   const [example, setExample] = useState("");
+  const [exampleSpanish, setExampleSpanish] = useState("");
   const [note, setNote] = useState("");
   const [kind, setKind] = useState<CardKind>("Sustantivo");
-  return <div className="modal-layer"><button className="modal-backdrop" onClick={onClose} /><form className="modal" onSubmit={(event) => { event.preventDefault(); if (german.trim() && spanish.trim()) onSave({ id: crypto.randomUUID(), folderId, german, spanish, example, note, kind }); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow dark">NUEVO CONTENIDO</span><h2>Agregar flashcard</h2><label>Alemán<input value={german} onChange={(e) => setGerman(e.target.value)} placeholder="die Sprache" autoFocus /></label><label>Español<input value={spanish} onChange={(e) => setSpanish(e.target.value)} placeholder="el idioma" /></label><label>Tipo<select value={kind} onChange={(e) => setKind(e.target.value as CardKind)}>{kinds.map((item) => <option key={item}>{item}</option>)}</select></label><label>Ejemplo<input value={example} onChange={(e) => setExample(e.target.value)} placeholder="Deutsch ist eine schöne Sprache." /></label><label>Nota<input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Plural o conjugación" /></label><button className="primary">Guardar tarjeta</button></form></div>;
+  return <div className="modal-layer"><button className="modal-backdrop" onClick={onClose} /><form className="modal" onSubmit={(event) => { event.preventDefault(); if (german.trim() && spanish.trim()) onSave({ id: crypto.randomUUID(), folderId, german, spanish, example, exampleSpanish, note, kind }); }}><button type="button" className="close" onClick={onClose}>×</button><span className="eyebrow dark">NUEVO CONTENIDO</span><h2>Agregar flashcard</h2><label>Alemán<input value={german} onChange={(e) => setGerman(e.target.value)} placeholder="die Sprache" autoFocus /></label><label>Español<input value={spanish} onChange={(e) => setSpanish(e.target.value)} placeholder="el idioma" /></label><label>Tipo<select value={kind} onChange={(e) => setKind(e.target.value as CardKind)}>{kinds.map((item) => <option key={item}>{item}</option>)}</select></label><label>Ejemplo en alemán<input value={example} onChange={(e) => setExample(e.target.value)} placeholder="Deutsch ist eine schöne Sprache." /></label><label>Traducción del ejemplo<input value={exampleSpanish} onChange={(e) => setExampleSpanish(e.target.value)} placeholder="El alemán es un idioma bonito." /></label><label>Nota<input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Plural, conjugación o caso" /></label><button className="primary">Guardar tarjeta</button></form></div>;
 }
