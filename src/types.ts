@@ -1,5 +1,10 @@
-export type Level = "A1" | "A2" | "B1" | "B2";
+export type Level = string;
 export type CardKind = "Sustantivo" | "Verbo" | "Expresion";
+
+export type Section = {
+  id: string;
+  name: string;
+};
 
 export type Folder = {
   id: string;
@@ -15,6 +20,7 @@ export type Flashcard = {
   german: string;
   spanish: string;
   example: string;
+  exampleSpanish?: string;
   kind: CardKind;
   note?: string;
 };
