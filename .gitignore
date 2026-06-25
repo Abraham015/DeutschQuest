@@ -1,4 +1,8 @@
 /node_modules
 /dist
+.env
 .idea
 .pdf-tools
+dev-*
+# Local Netlify folder
+.netlify
