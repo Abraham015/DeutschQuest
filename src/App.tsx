@@ -1,6 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import Swal from "sweetalert2";
 import { importedFolderCounts, starterCards, starterFolders, starterSections } from "./data";
+import { useSupabaseAccount } from "./hooks/useSupabaseAccount";
 import type { CardKind, Flashcard, Folder, Level, Section } from "./types";
+import {
+  createRemoteFlashcard,
+  createRemoteFolder,
+  createRemoteSection,
+  deleteRemoteFlashcard,
+  deleteRemoteFolder,
+  deleteRemoteSection,
+  getErrorMessage,
+  loadDeutschQuestData,
+  saveLocalDeutschQuestData,
+  updateRemoteFolder,
+  updateRemoteSection,
+} from "./utils/deutschquestStorage";
 
 const kinds: CardKind[] = ["Sustantivo", "Verbo", "Expresion"];
 type StudyMode = "flashcard" | "multiple" | "write";
@@ -23,6 +38,12 @@ function isGrammarFolder(folder: Folder) {
   const normalizedName = folder.name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
   return folder.id.toLowerCase().includes("grammar") || normalizedName.includes("gramatica");
 }
+
+const fallbackData = {
+  sections: starterSections,
+  folders: starterFolders.filter((folder) => !isGrammarFolder(folder)),
+  cards: starterCards,
+};
 
 function loadFolders() {
   const saved = load<Folder[]>("dq-folders", starterFolders);
@@ -52,12 +73,25 @@ function shuffled<T>(items: T[]) {
   return [...items].sort(() => Math.random() - 0.5);
 }
 
+async function showResultAlert(ok: boolean, title: string, message?: string) {
+  await Swal.fire({
+    icon: ok ? "success" : "error",
+    title,
+    text: message,
+    confirmButtonText: "Entendido",
+  });
+}
+
 export default function App() {
+  const account = useSupabaseAccount();
   const [folders, setFolders] = useState<Folder[]>(loadFolders);
   const [sections, setSections] = useState<Section[]>(loadSections);
   const [cards, setCards] = useState<Flashcard[]>(() => loadCards(loadFolders()));
   const [importedCards, setImportedCards] = useState<Flashcard[]>([]);
   const [importedCardsLoading, setImportedCardsLoading] = useState(false);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [isRemote, setIsRemote] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [visibleCardCount, setVisibleCardCount] = useState(libraryPageSize);
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [activeLevel, setActiveLevel] = useState<Level | "Todos">("Todos");
@@ -76,10 +110,42 @@ export default function App() {
   const [editingFolder, setEditingFolder] = useState<Folder | null>(null);
   const [editingSection, setEditingSection] = useState<Section | null>(null);
   const [addingSection, setAddingSection] = useState(false);
+  const [currentView, setCurrentView] = useState<"home" | "account">("home");
 
-  useEffect(() => localStorage.setItem("dq-folders", JSON.stringify(folders)), [folders]);
-  useEffect(() => localStorage.setItem("dq-sections", JSON.stringify(sections)), [sections]);
-  useEffect(() => localStorage.setItem("dq-cards", JSON.stringify(cards)), [cards]);
+  useEffect(() => {
+    let isActive = true;
+
+    async function loadData() {
+      setDataLoading(true);
+      setSyncError(null);
+
+      try {
+        const data = await loadDeutschQuestData(fallbackData);
+
+        if (!isActive) return;
+
+        setSections(data.sections);
+        setFolders(data.folders);
+        setCards(data.cards);
+        setIsRemote(data.isRemote);
+      } catch (err) {
+        if (isActive) {
+          setIsRemote(false);
+          setSyncError(getErrorMessage(err, "No se pudo sincronizar Supabase."));
+        }
+      } finally {
+        if (isActive) setDataLoading(false);
+      }
+    }
+
+    void loadData();
+
+    return () => {
+      isActive = false;
+    };
+  }, [account.email]);
+
+  useEffect(() => saveLocalDeutschQuestData({ sections, folders, cards }), [folders, sections, cards]);
   useEffect(() => localStorage.setItem("dq-import-version", importVersion), []);
 
   const activeImportedFolderIds = useMemo(() => new Set(folders.filter((item) => importedFolderIds.has(item.id)).map((item) => item.id)), [folders]);
@@ -119,6 +185,47 @@ export default function App() {
     }
   }
 
+  async function syncRemote(action: () => Promise<void>, fallbackMessage: string) {
+    if (!account.isSignedIn) return;
+
+    setSyncError(null);
+
+    try {
+      await action();
+    } catch (err) {
+      const message = getErrorMessage(err, fallbackMessage);
+      setSyncError(message);
+      await Swal.fire({
+        icon: "error",
+        title: "No se pudo sincronizar",
+        text: message,
+        confirmButtonText: "Entendido",
+      });
+      throw err;
+    }
+  }
+
+  async function saveFolder(nextFolder: Folder, previousFolder?: Folder) {
+    if (previousFolder) {
+      setFolders((current) => current.map((item) => item.id === nextFolder.id ? nextFolder : item));
+      await syncRemote(() => updateRemoteFolder(nextFolder), "No se pudo actualizar la carpeta.");
+      return;
+    }
+
+    setFolders((current) => [...current, nextFolder]);
+    await syncRemote(() => createRemoteFolder(nextFolder), "No se pudo guardar la carpeta.");
+  }
+
+  async function saveCard(card: Flashcard) {
+    setCards((current) => [...current, card]);
+    await syncRemote(() => createRemoteFlashcard(card), "No se pudo guardar la tarjeta.");
+  }
+
+  async function removeCard(card: Flashcard) {
+    setCards((current) => current.filter((item) => item.id !== card.id));
+    await syncRemote(() => deleteRemoteFlashcard(card.id), "No se pudo eliminar la tarjeta.");
+  }
+
   useEffect(() => {
     if (query.trim()) void loadImportedCards();
   }, [query]);
@@ -133,6 +240,7 @@ export default function App() {
   }
 
   function openFolder(id: string) {
+    setCurrentView("home");
     setSelectedFolder(id);
     setVisibleCardCount(libraryPageSize);
     setMode("library");
@@ -140,25 +248,49 @@ export default function App() {
     if (importedFolderIds.has(id)) void loadImportedCards();
   }
 
-  function deleteFolder(folderToDelete: Folder) {
-    if (!window.confirm(`¿Eliminar la carpeta "${folderToDelete.name}" y todas sus tarjetas?`)) return;
+  async function deleteFolder(folderToDelete: Folder) {
+    const result = await Swal.fire({
+      icon: "warning",
+      title: "Eliminar carpeta",
+      text: `¿Eliminar la carpeta "${folderToDelete.name}" y todas sus tarjetas?`,
+      showCancelButton: true,
+      confirmButtonText: "Eliminar",
+      cancelButtonText: "Cancelar",
+      confirmButtonColor: "#9a453e",
+    });
+
+    if (!result.isConfirmed) return;
+
     setFolders((current) => current.filter((item) => item.id !== folderToDelete.id));
     setCards((current) => current.filter((card) => card.folderId !== folderToDelete.id));
     setSelectedFolder(null);
+    await syncRemote(() => deleteRemoteFolder(folderToDelete.id), "No se pudo eliminar la carpeta.");
   }
 
-  function deleteSection(section: Section) {
+  async function deleteSection(section: Section) {
     const folderIds = new Set(folders.filter((item) => item.level === section.id).map((item) => item.id));
-    if (!window.confirm(`¿Eliminar la sección "${section.name}", sus carpetas y todas sus tarjetas?`)) return;
+    const result = await Swal.fire({
+      icon: "warning",
+      title: "Eliminar seccion",
+      text: `¿Eliminar la seccion "${section.name}", sus carpetas y todas sus tarjetas?`,
+      showCancelButton: true,
+      confirmButtonText: "Eliminar",
+      cancelButtonText: "Cancelar",
+      confirmButtonColor: "#9a453e",
+    });
+
+    if (!result.isConfirmed) return;
+
     setSections((current) => current.filter((item) => item.id !== section.id));
     setFolders((current) => current.filter((item) => item.level !== section.id));
     setCards((current) => current.filter((card) => !folderIds.has(card.folderId)));
     setActiveLevel("Todos");
     setSelectedFolder(null);
     setEditingSection(null);
+    await syncRemote(() => deleteRemoteSection(section.id), "No se pudo eliminar la seccion.");
   }
 
-  function saveSection(nextSection: Section, previousId?: string) {
+  async function saveSection(nextSection: Section, previousId?: string) {
     if (previousId) {
       setSections((current) => current.map((item) => item.id === previousId ? nextSection : item));
       setFolders((current) => current.map((item) => item.level === previousId ? { ...item, level: nextSection.id } : item));
@@ -168,6 +300,10 @@ export default function App() {
     }
     setEditingSection(null);
     setAddingSection(false);
+    await syncRemote(
+      () => previousId ? updateRemoteSection(nextSection, previousId) : createRemoteSection(nextSection),
+      "No se pudo guardar la seccion.",
+    );
   }
 
   function startPractice() {
@@ -206,9 +342,8 @@ export default function App() {
           <div><strong>DeutschQuest</strong><small>Tu espacio de estudio</small></div>
         </div>
         <nav>
-          <button className={!selectedFolder ? "active" : ""} onClick={() => setSelectedFolder(null)}><span>⌂</span> Inicio</button>
-          <button onClick={() => { setSelectedFolder(null); setAdding("folder"); }}><span>□</span> Carpetas</button>
-          <button onClick={() => setQuery("der")}><span>◇</span> Vocabulario</button>
+          <button className={!selectedFolder && currentView === "home" ? "active" : ""} onClick={() => { setCurrentView("home"); setSelectedFolder(null); }}><span>⌂</span> Inicio</button>
+          <button className={currentView === "account" ? "active" : ""} onClick={() => { setCurrentView("account"); setSelectedFolder(null); }}><span>◉</span> Cuenta</button>
         </nav>
         <div className="sidebar-bottom">
           <div className="mini-progress"><span>Progreso general</span><strong>{progress}%</strong><i><b style={{ width: `${progress}%` }} /></i></div>
@@ -223,7 +358,7 @@ export default function App() {
           <button className="menu-toggle" onClick={() => setMenuOpen(true)}>☰</button>
           <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar palabra, traducción o ejemplo..." /></label>
           <div className="streak"><span>●</span><strong>7</strong><small>días</small></div>
-          <button className="avatar">AH</button>
+          <AccountButton onOpen={() => { setCurrentView("account"); setSelectedFolder(null); }} />
           {searchCards.length > 0 && (
             <div className="search-popover">
               {searchCards.slice(0, 6).map((card) => <button key={card.id} onClick={() => { openFolder(card.folderId); setQuery(""); }}><strong>{card.german}</strong><span>{card.spanish}</span></button>)}
@@ -231,8 +366,15 @@ export default function App() {
           )}
         </header>
 
-        {!folder ? (
+        {!folder && currentView === "account" ? (
+          <AccountPage
+            cards={cards}
+            folders={folders}
+            isRemote={isRemote}
+          />
+        ) : !folder ? (
           <div className="page">
+            {(dataLoading || syncError || !account.isConfigured) && <SyncNotice loading={dataLoading} error={syncError} isConfigured={account.isConfigured} />}
             <section className="hero">
               <div><span className="eyebrow">GUTEN TAG</span><h1>Continúa tu camino<br />hacia el alemán.</h1><p>Organiza, repasa y domina cada lección a tu ritmo.</p></div>
               <div className="hero-card"><span>Palabra del día</span><strong>die Gelegenheit</strong><em>la oportunidad</em><p>Das ist eine gute Gelegenheit.</p></div>
@@ -262,19 +404,19 @@ export default function App() {
           </div>
         ) : (
           <div className="page">
-            <button className="back-link" onClick={() => setSelectedFolder(null)}>← Volver a carpetas</button>
+            <button className="back-link" onClick={() => { setCurrentView("home"); setSelectedFolder(null); }}>← Volver a carpetas</button>
             <section className="folder-hero" style={{ "--accent": folder.color } as React.CSSProperties}>
               <div><span className="folder-level">{folder.level}</span><h1>{folder.name}</h1><p>{folder.description} · {folderCards.length} tarjetas</p></div>
               <div className="folder-actions">
                 <button className={mode === "library" ? "active" : ""} onClick={() => setMode("library")}>Biblioteca</button>
                 <button className={mode === "study" ? "active" : ""} onClick={startPractice}>Practicar</button>
                 <button className="primary" onClick={() => setAdding("card")}>+ Tarjeta</button>
-                <details className="action-menu"><summary aria-label="Más opciones de carpeta">•••</summary><div><button onClick={() => setEditingFolder(folder)}>Editar carpeta</button><button className="danger-action" onClick={() => deleteFolder(folder)}>Eliminar carpeta</button></div></details>
+                <details className="action-menu"><summary aria-label="Más opciones de carpeta">•••</summary><div><button onClick={() => setEditingFolder(folder)}>Editar carpeta</button><button className="danger-action" onClick={() => void deleteFolder(folder)}>Eliminar carpeta</button></div></details>
               </div>
             </section>
 
             {mode === "library" ? (
-              importedCardsLoading ? <p className="empty">Cargando tarjetas...</p> : <><section className="card-grid">{folderCards.slice(0, visibleCardCount).map((card) => <article className="word-card" key={card.id}><span>{card.kind}</span><h2>{card.german}</h2><strong>{card.spanish}</strong><p>{card.example}</p>{card.exampleSpanish && <p className="example-translation">{card.exampleSpanish}</p>}{card.note && <small>{card.note}</small>}{!card.id.startsWith("verb-prep-") && <button onClick={() => setCards(cards.filter((item) => item.id !== card.id))}>Eliminar</button>}</article>)}</section>{visibleCardCount < folderCards.length && <button className="load-more" onClick={() => setVisibleCardCount((count) => count + libraryPageSize)}>Mostrar más ({folderCards.length - visibleCardCount} restantes)</button>}</>
+              importedCardsLoading ? <p className="empty">Cargando tarjetas...</p> : <><section className="card-grid">{folderCards.slice(0, visibleCardCount).map((card) => <article className="word-card" key={card.id}><span>{card.kind}</span><h2>{card.german}</h2><strong>{card.spanish}</strong><p>{card.example}</p>{card.exampleSpanish && <p className="example-translation">{card.exampleSpanish}</p>}{card.note && <small>{card.note}</small>}{!card.id.startsWith("verb-prep-") && <button onClick={() => void removeCard(card)}>Eliminar</button>}</article>)}</section>{visibleCardCount < folderCards.length && <button className="load-more" onClick={() => setVisibleCardCount((count) => count + libraryPageSize)}>Mostrar más ({folderCards.length - visibleCardCount} restantes)</button>}</>
             ) : currentCard ? (
               <section className="study-area">
                 <div className="study-modes">
@@ -327,10 +469,187 @@ export default function App() {
         )}
       </main>
 
-      {adding === "folder" && <FolderModal sections={sections} onClose={() => setAdding(null)} onSave={(newFolder) => { setFolders([...folders, newFolder]); setAdding(null); }} />}
-      {editingFolder && <FolderModal sections={sections} initial={editingFolder} onClose={() => setEditingFolder(null)} onSave={(updated) => { setFolders(folders.map((item) => item.id === updated.id ? updated : item)); setEditingFolder(null); }} />}
+      {adding === "folder" && <FolderModal sections={sections} onClose={() => setAdding(null)} onSave={(newFolder) => { void saveFolder(newFolder); setAdding(null); }} />}
+      {editingFolder && <FolderModal sections={sections} initial={editingFolder} onClose={() => setEditingFolder(null)} onSave={(updated) => { void saveFolder(updated, editingFolder); setEditingFolder(null); }} />}
       {(addingSection || editingSection) && <SectionModal initial={editingSection ?? undefined} sections={sections} onClose={() => { setAddingSection(false); setEditingSection(null); }} onSave={saveSection} onDelete={editingSection ? deleteSection : undefined} />}
-      {adding === "card" && folder && <CardModal folderId={folder.id} onClose={() => setAdding(null)} onSave={(card) => { setCards([...cards, card]); setAdding(null); }} />}
+      {adding === "card" && folder && <CardModal folderId={folder.id} onClose={() => setAdding(null)} onSave={(card) => { void saveCard(card); setAdding(null); }} />}
+    </div>
+  );
+}
+
+function SyncNotice({ loading, error, isConfigured }: { loading: boolean; error: string | null; isConfigured: boolean }) {
+  if (loading) return <p className="sync-notice">Cargando tu biblioteca...</p>;
+  if (error) return <p className="sync-notice error">{error}</p>;
+  if (!isConfigured) return <p className="sync-notice">Supabase no esta configurado. Tus cambios se guardan solo en este navegador.</p>;
+
+  return null;
+}
+
+function AccountButton({ onOpen }: { onOpen: () => void }) {
+  const { displayName, isConfigured, isLoading, isSignedIn, signOut } = useSupabaseAccount();
+
+  if (!isConfigured) {
+    return <button className="account-pill" onClick={onOpen}>Local</button>;
+  }
+
+  if (!isSignedIn) {
+    return <button className="account-pill" onClick={onOpen} disabled={isLoading}>Iniciar sesion</button>;
+  }
+
+  return (
+    <div className="account-actions">
+      <button className="account-pill" onClick={onOpen}>{displayName || "Cuenta"}</button>
+      <button className="account-signout" onClick={() => void signOut()} disabled={isLoading}>Salir</button>
+    </div>
+  );
+}
+
+function AccountPage({ cards, folders, isRemote }: { cards: Flashcard[]; folders: Folder[]; isRemote: boolean }) {
+  const account = useSupabaseAccount();
+  const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
+  const [authEmail, setAuthEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [displayName, setDisplayName] = useState(account.displayName ?? "");
+  const [newEmail, setNewEmail] = useState(account.email ?? "");
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    setDisplayName(account.displayName ?? "");
+    setNewEmail(account.email ?? "");
+  }, [account.displayName, account.email]);
+
+  async function submitAuth(event: FormEvent) {
+    event.preventDefault();
+    setSubmitting(true);
+
+    try {
+      const result = authMode === "signin"
+        ? await account.signIn(authEmail, password)
+        : await account.signUp(authEmail, password, displayName);
+
+      if (result.ok) setPassword("");
+      if (result.ok && authMode === "signup") setAuthMode("signin");
+
+      await showResultAlert(
+        result.ok,
+        result.ok ? (authMode === "signin" ? "Sesion iniciada" : "Cuenta creada") : (authMode === "signin" ? "No se pudo iniciar sesion" : "No se pudo crear la cuenta"),
+        result.message,
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function submitDisplayName(event: FormEvent) {
+    event.preventDefault();
+    if (!displayName.trim()) return;
+
+    setSubmitting(true);
+    const result = await account.updateDisplayName(displayName);
+    await showResultAlert(
+      result.ok,
+      result.ok ? "Nombre actualizado" : "No se pudo actualizar",
+      result.message,
+    );
+    setSubmitting(false);
+  }
+
+  async function submitEmail(event: FormEvent) {
+    event.preventDefault();
+    if (!newEmail.trim() || newEmail === account.email) return;
+
+    setSubmitting(true);
+    const result = await account.updateEmail(newEmail);
+    await showResultAlert(
+      result.ok,
+      result.ok ? "Revisa tu correo" : "No se pudo cambiar el email",
+      result.message,
+    );
+    setSubmitting(false);
+  }
+
+  if (!account.isConfigured) {
+    return (
+      <div className="page account-page">
+        <section className="account-panel">
+          <h1>Cuenta</h1>
+          <p>Supabase no esta configurado. Revisa las variables de entorno de DeutschQuest.</p>
+        </section>
+      </div>
+    );
+  }
+
+  if (!account.isSignedIn) {
+    return (
+      <div className="page account-page">
+        <section className="account-panel account-auth-panel">
+          <span className="account-kicker">Panel personal</span>
+          <h1>{authMode === "signin" ? "Iniciar sesion" : "Crear cuenta"}</h1>
+          <p>{authMode === "signin" ? "Entra para sincronizar tus tarjetas." : "Crea tu cuenta para guardar tus tarjetas en Supabase."}</p>
+
+          <form className="account-form" onSubmit={submitAuth}>
+            {authMode === "signup" && (
+              <label>Nombre visible<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Tu nombre" /></label>
+            )}
+            <label>Email<input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="tu@email.com" autoFocus /></label>
+            <label>Contrasena<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Minimo 6 caracteres" /></label>
+            <div className="account-page-actions">
+              <button className="primary" disabled={submitting}>{submitting ? "Procesando..." : authMode === "signin" ? "Entrar" : "Crear cuenta"}</button>
+              <button type="button" className="secondary-inline" onClick={() => setAuthMode(authMode === "signin" ? "signup" : "signin")} disabled={submitting}>
+                {authMode === "signin" ? "Crear cuenta" : "Ya tengo cuenta"}
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+    );
+  }
+
+  return (
+    <div className="page account-page">
+      <section className="account-overview">
+        <div>
+          <span className="account-kicker">Panel personal</span>
+          <h1>Tu cuenta</h1>
+          <p>Administra tu perfil y revisa como se guardan tus materiales.</p>
+        </div>
+        <button type="button" className="secondary-button" onClick={() => void account.signOut()}>Cerrar sesion</button>
+      </section>
+
+      <section className="account-stats" aria-label="Resumen de cuenta">
+        <article><span>Tarjetas</span><strong>{cards.length}</strong><small>Guardadas para practicar</small></article>
+        <article><span>Carpetas</span><strong>{folders.length}</strong><small>Colecciones organizadas</small></article>
+        <article><span>Sincronizacion</span><strong>{isRemote ? "Activa" : "Local"}</strong><small>{isRemote ? "Supabase conectado" : "Solo en este dispositivo"}</small></article>
+        <article><span>Seguridad</span><strong>30 min</strong><small>Cierre por inactividad</small></article>
+      </section>
+
+      <section className="account-settings-grid">
+        <div className="account-panel">
+          <h2>Perfil</h2>
+          <p>Este nombre se muestra en el boton de cuenta de la cabecera.</p>
+          <form className="account-form" onSubmit={submitDisplayName}>
+            <label>Nombre visible<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Tu nombre" /></label>
+            <button className="primary" disabled={submitting}>Guardar nombre</button>
+          </form>
+        </div>
+
+        <div className="account-panel">
+          <h2>Correo de acceso</h2>
+          <p>Supabase enviara una confirmacion antes de aplicar el cambio.</p>
+          <form className="account-form" onSubmit={submitEmail}>
+            <label>Correo<input type="email" value={newEmail} onChange={(event) => setNewEmail(event.target.value)} placeholder="nuevo@email.com" /></label>
+            <button className="primary" disabled={submitting || newEmail === account.email}>Cambiar email</button>
+          </form>
+        </div>
+      </section>
+
+      <section className="account-panel account-security-note">
+        <div>
+          <h2>Proteccion de tus datos</h2>
+          <p>Tus tarjetas se sincronizan automaticamente al iniciar sesion. La sesion se cierra tras 30 minutos sin actividad.</p>
+        </div>
+        <span>Sesion protegida</span>
+      </section>
     </div>
   );
 }
